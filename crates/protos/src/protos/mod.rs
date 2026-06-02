@@ -89,7 +89,7 @@ pub mod coresdk {
             fn from(v: workflow_command::Variant) -> Self {
                 Self {
                     variant: Some(v),
-                    user_metadata: None,
+                    ..Default::default()
                 }
             }
         }
@@ -1309,6 +1309,7 @@ pub mod coresdk {
                         input: Vec::from_payloads(a.input),
                         identity: a.identity,
                         headers: a.header.map(Into::into).unwrap_or_default(),
+                        originating_event_id: 0,
                     }
                 }
             }
@@ -1325,6 +1326,7 @@ pub mod coresdk {
                 workflow_id: String,
                 randomness_seed: u64,
                 start_time: Timestamp,
+                originating_event_id: i64,
             ) -> InitializeWorkflow {
                 InitializeWorkflow {
                     workflow_type: attrs.workflow_type.map(|wt| wt.name).unwrap_or_default(),
@@ -1358,6 +1360,7 @@ pub mod coresdk {
                     start_time: Some(start_time),
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
+                    originating_event_id,
                 }
             }
         }

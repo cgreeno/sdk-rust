@@ -630,6 +630,7 @@ impl ManagedRun {
                                 failure: failure.failure,
                             }),
                             metadata: None,
+                            event_group_markers: vec![],
                         }],
                         vec![],
                         VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
@@ -1633,6 +1634,7 @@ mod tests {
                     result: None,
                 }),
                 metadata: None,
+                event_group_markers: vec![],
             }
         }
 
@@ -1640,6 +1642,7 @@ mod tests {
             WFCommand {
                 variant: WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}),
                 metadata: None,
+                event_group_markers: vec![],
             }
         }
 
@@ -1650,6 +1653,7 @@ mod tests {
                     variant: None,
                 }),
                 metadata: None,
+                event_group_markers: vec![],
             }
         }
 
@@ -1660,6 +1664,7 @@ mod tests {
                     response: None,
                 }),
                 metadata: None,
+                event_group_markers: vec![],
             }
         }
 

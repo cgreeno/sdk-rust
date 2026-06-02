@@ -6,6 +6,7 @@ mod client_interactions;
 mod continue_as_new;
 mod determinism;
 mod eager;
+mod event_groups;
 mod local_activities;
 mod modify_wf_properties;
 mod nexus;
@@ -1076,6 +1077,7 @@ async fn pass_timer_summary_to_metadata() {
             ctx.timer(TimerOptions {
                 duration: Duration::from_secs(1),
                 summary: Some("timer summary".to_string()),
+                ..Default::default()
             })
             .await;
             Ok(())
