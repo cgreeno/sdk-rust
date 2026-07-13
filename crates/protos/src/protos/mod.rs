@@ -1361,6 +1361,7 @@ pub mod coresdk {
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
                     originating_event_id,
+                    original_execution_run_id: attrs.original_execution_run_id,
                 }
             }
         }

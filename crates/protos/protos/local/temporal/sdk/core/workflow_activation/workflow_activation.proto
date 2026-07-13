@@ -215,6 +215,11 @@ message InitializeWorkflow {
     // Always `1` in practice. Used by SDKs that auto-create an implicit event group marker
     // wrapping the workflow's main function. See `temporal.api.sdk.v1.EventGroupMarker`.
     int64 originating_event_id = 26;
+    // The run id recorded on the `WORKFLOW_EXECUTION_STARTED` event. Unlike the execution's current
+    // run id, this value is preserved across workflow resets, which makes it suitable as a stable salt
+    // for deriving Event Group label identifiers. Mirrors `original_execution_run_id` on
+    // `WorkflowExecutionStartedEventAttributes`.
+    string original_execution_run_id = 27;
 }
 
 // Notify a workflow that a timer has fired
