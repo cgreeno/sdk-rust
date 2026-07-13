@@ -629,8 +629,7 @@ impl ManagedRun {
                             variant: WFCommandVariant::FailWorkflow(FailWorkflowExecution {
                                 failure: failure.failure,
                             }),
-                            metadata: None,
-                            event_group_markers: vec![],
+                            ..Default::default()
                         }],
                         vec![],
                         VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
@@ -1633,16 +1632,14 @@ mod tests {
                 variant: WFCommandVariant::CompleteWorkflow(CompleteWorkflowExecution {
                     result: None,
                 }),
-                metadata: None,
-                event_group_markers: vec![],
+                ..Default::default()
             }
         }
 
         pub(crate) fn cancel() -> WFCommand {
             WFCommand {
                 variant: WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}),
-                metadata: None,
-                event_group_markers: vec![],
+                ..Default::default()
             }
         }
 
@@ -1652,8 +1649,7 @@ mod tests {
                     query_id: "".into(),
                     variant: None,
                 }),
-                metadata: None,
-                event_group_markers: vec![],
+                ..Default::default()
             }
         }
 
@@ -1663,8 +1659,7 @@ mod tests {
                     protocol_instance_id: "".into(),
                     response: None,
                 }),
-                metadata: None,
-                event_group_markers: vec![],
+                ..Default::default()
             }
         }
 

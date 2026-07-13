@@ -100,8 +100,7 @@ impl DrivenWorkflow {
         let in_cmds = in_cmds.unwrap_or_else(|_| {
             vec![WFCommand {
                 variant: WFCommandVariant::NoCommandsFromLang,
-                metadata: None,
-                event_group_markers: vec![],
+                ..Default::default()
             }]
         });
         debug!(in_cmds = %in_cmds.display(), "wf bridge iteration fetch");

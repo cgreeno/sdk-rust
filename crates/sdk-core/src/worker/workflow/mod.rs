@@ -1353,7 +1353,7 @@ struct EmptyWorkflowCommandErr;
 
 /// [DrivenWorkflow]s respond with these when called, to indicate what they want to do next.
 /// EX: Create a new timer, complete the workflow, etc.
-#[derive(Debug, derive_more::From, derive_more::Display)]
+#[derive(Debug, Default, derive_more::From, derive_more::Display)]
 #[display("{}", variant)]
 struct WFCommand {
     variant: WFCommandVariant,
@@ -1361,10 +1361,11 @@ struct WFCommand {
     event_group_markers: Vec<EventGroupMarker>,
 }
 
-#[derive(Debug, derive_more::From, derive_more::Display)]
+#[derive(Debug, Default, derive_more::From, derive_more::Display)]
 #[allow(clippy::large_enum_variant)]
 enum WFCommandVariant {
     /// Returned when we need to wait for the lang sdk to send us something
+    #[default]
     NoCommandsFromLang,
     AddActivity(ScheduleActivity),
     AddLocalActivity(ScheduleLocalActivity),
