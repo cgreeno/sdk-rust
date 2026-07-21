@@ -1381,10 +1381,14 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::AddLocalActivity(attrs) => {
                     let seq = attrs.seq;
-                    let attrs: ValidScheduleLA =
-                        ValidScheduleLA::from_schedule_la(attrs, cmd.metadata).map_err(|e| {
-                            fatal!("Invalid schedule local activity request (seq {seq}): {e}")
-                        })?;
+                    let attrs: ValidScheduleLA = ValidScheduleLA::from_schedule_la(
+                        attrs,
+                        cmd.metadata,
+                        cmd.event_group_markers,
+                    )
+                    .map_err(|e| {
+                        fatal!("Invalid schedule local activity request (seq {seq}): {e}")
+                    })?;
                     let (la, mach_resp) = new_local_activity(
                         attrs,
                         self.replaying,
