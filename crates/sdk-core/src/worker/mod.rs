@@ -450,6 +450,7 @@ pub struct NamespaceCapabilities {
     pub(crate) graceful_poll_shutdown: AtomicBool,
     pub(crate) poller_autoscaling: AtomicBool,
     pub(crate) worker_commands: AtomicBool,
+    pub(crate) workflow_task_completion_pagination: AtomicBool,
 }
 
 impl NamespaceCapabilities {
@@ -468,6 +469,13 @@ impl NamespaceCapabilities {
     /// Returns true if worker commands are supported in this namespace.
     pub fn worker_commands(&self) -> bool {
         self.worker_commands.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the namespace accepts paginated `RespondWorkflowTaskCompleted` requests, so
+    /// large completions may be split across multiple page requests sharing one task token.
+    pub fn workflow_task_completion_pagination(&self) -> bool {
+        self.workflow_task_completion_pagination
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -567,6 +575,11 @@ impl Worker {
                     if caps.worker_commands {
                         self.capabilities
                             .worker_commands
+                            .store(true, Ordering::Relaxed);
+                    }
+                    if caps.workflow_task_completion_pagination {
+                        self.capabilities
+                            .workflow_task_completion_pagination
                             .store(true, Ordering::Relaxed);
                     }
                 }
@@ -693,6 +706,7 @@ impl Worker {
             graceful_poll_shutdown: AtomicBool::new(false),
             poller_autoscaling: AtomicBool::new(false),
             worker_commands: AtomicBool::new(false),
+            workflow_task_completion_pagination: AtomicBool::new(false),
         });
 
         let nexus_slots = MeteredPermitDealer::new(
@@ -936,6 +950,7 @@ impl Worker {
                         shutdown_token: shutdown_token.child_token(),
                         metrics,
                         server_capabilities: client.capabilities().unwrap_or_default(),
+                        namespace_capabilities: capabilities.clone(),
                         sdk_name: sdk_name_and_ver.0,
                         sdk_version: sdk_name_and_ver.1,
                         default_versioning_behavior: config

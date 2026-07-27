@@ -5,7 +5,9 @@ use crate::{
     protosext::legacy_query_failure,
     worker::{WorkerVersioningStrategy, worker_control_task_queue},
 };
+use futures_util::{StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
+use prost::Message;
 use prost_types::Duration as PbDuration;
 use std::{
     collections::HashMap,
@@ -46,6 +48,101 @@ use tonic::IntoRequest;
 use uuid::Uuid;
 
 type Result<T, E = tonic::Status> = std::result::Result<T, E>;
+
+/// Target maximum encoded size of a single workflow task completion page. Kept safely below the
+/// server's ~4 MiB gRPC request limit to leave headroom for request framing and metadata not
+/// accounted for while greedily packing commands into intermediate pages.
+const MAX_WFT_COMPLETION_PAGE_SIZE: usize = 3 * 1024 * 1024;
+/// How many times all pages are resent from page 0 after the server reports it lost the buffered
+/// pages of a paginated completion before giving up.
+const MAX_WFT_COMPLETION_PAGE_RESENDS: usize = 3;
+
+/// Split a workflow task completion into ordered page requests when it would exceed
+/// `max_page_bytes`.
+///
+/// Commands are distributed across intermediate pages (`intermediate_page = true`, `page_number`
+/// `0..N-1`); the final page keeps all messages and remaining metadata with `intermediate_page =
+/// false` and `page_number = N`, telling the server how many intermediate pages preceded it. All
+/// pages share the original task token.
+///
+/// Returns a single-element vec (the request unchanged) when it already fits, or when a single
+/// command is itself larger than a page and so cannot be split — in that case the server rejects
+/// the oversized request and the normal grpc-message-too-large path applies.
+fn paginate_wft_completion(
+    mut request: RespondWorkflowTaskCompletedRequest,
+    max_page_bytes: usize,
+) -> Vec<RespondWorkflowTaskCompletedRequest> {
+    if request.encoded_len() <= max_page_bytes {
+        return vec![request];
+    }
+
+    let commands = std::mem::take(&mut request.commands);
+
+    // Intermediate pages carry only the routing fields plus their command chunk; the metadata and
+    // messages left on `request` become the final page.
+    let intermediate_template = RespondWorkflowTaskCompletedRequest {
+        task_token: request.task_token.clone(),
+        identity: request.identity.clone(),
+        namespace: request.namespace.clone(),
+        intermediate_page: true,
+        ..Default::default()
+    };
+    let base_len = intermediate_template.encoded_len();
+    // Each command is a repeated message entry: a field tag plus a length-delimited body. Six bytes
+    // bounds the tag (1) and the length varint (up to 5) so pages stay under the limit.
+    let command_framing = 6;
+
+    // If any single command cannot fit in a page on its own, pagination cannot help; leave the
+    // request intact and let the server reject it.
+    if commands
+        .iter()
+        .any(|c| base_len + c.encoded_len() + command_framing > max_page_bytes)
+    {
+        request.commands = commands;
+        return vec![request];
+    }
+
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    let mut current_len = base_len;
+    for command in commands {
+        let command_len = command.encoded_len() + command_framing;
+        if !current.is_empty() && current_len + command_len > max_page_bytes {
+            let mut page = intermediate_template.clone();
+            page.commands = std::mem::take(&mut current);
+            page.page_number = pages.len() as i32;
+            pages.push(page);
+            current_len = base_len;
+        }
+        current_len += command_len;
+        current.push(command);
+    }
+    if !current.is_empty() {
+        let mut page = intermediate_template.clone();
+        page.commands = current;
+        page.page_number = pages.len() as i32;
+        pages.push(page);
+    }
+
+    request.page_number = pages.len() as i32;
+    request.intermediate_page = false;
+    pages.push(request);
+    pages
+}
+
+/// Returns true if `status` carries a `WorkflowTaskCompletionBufferLostFailure` detail, signalling
+/// the server dropped the buffered pages of a paginated completion and they must be resent from
+/// page 0. The detail message is empty, so it is matched by type URL rather than by decoding.
+fn is_workflow_task_completion_buffer_lost(status: &tonic::Status) -> bool {
+    temporalio_common::protos::google::rpc::Status::decode(status.details())
+        .map(|rpc_status| {
+            rpc_status.details.iter().any(|d| {
+                d.type_url
+                    .ends_with(".WorkflowTaskCompletionBufferLostFailure")
+            })
+        })
+        .unwrap_or(false)
+}
 
 /// The result of a legacy query sent via `respond_legacy_query`.
 pub enum LegacyQueryResult {
@@ -457,6 +554,7 @@ impl WorkerClient for WorkerClientBag {
         &self,
         request: WorkflowTaskCompletion,
     ) -> Result<RespondWorkflowTaskCompletedResponse> {
+        let pagination_enabled = request.pagination_enabled;
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskCompletedRequest {
             task_token: request.task_token.into(),
@@ -498,17 +596,67 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             resource_id: Default::default(),
-            // Pagination fields: default to a single, final page. Pagination logic will
-            // populate these when splitting large completions.
             page_number: 0,
             intermediate_page: false,
         };
-        Ok(self
-            .client
-            .clone()
-            .respond_workflow_task_completed(request.into_request())
-            .await?
-            .into_inner())
+
+        // When the namespace supports it and the completion is too large for a single request, it
+        // is split into pages that share one task token. Otherwise a single request is sent, and an
+        // oversized one is rejected by the server and surfaced as a grpc-message-too-large failure.
+        let pages = if pagination_enabled {
+            paginate_wft_completion(request, MAX_WFT_COMPLETION_PAGE_SIZE)
+        } else {
+            vec![request]
+        };
+        if pages.len() == 1 {
+            let request = pages.into_iter().next().expect("one page always present");
+            return Ok(self
+                .client
+                .clone()
+                .respond_workflow_task_completed(request.into_request())
+                .await?
+                .into_inner());
+        }
+
+        // Intermediate pages (0..N-2) may be sent concurrently; the final page is sent only once
+        // they are all acknowledged. If the server reports it lost the buffered pages, everything
+        // is resent from page 0.
+        let (intermediate_pages, final_page) = pages.split_at(pages.len() - 1);
+        let final_page = &final_page[0];
+        let mut resends = 0;
+        loop {
+            let send_all = async {
+                // `try_collect` short-circuits on the first error, dropping (cancelling) any pages
+                // still in flight rather than waiting for them, since a failure means we will either
+                // fail the task or resend everything from page 0.
+                stream::iter(intermediate_pages.iter().cloned())
+                    .map(|page| {
+                        let mut client = self.client.clone();
+                        async move {
+                            client
+                                .respond_workflow_task_completed(page.into_request())
+                                .await
+                        }
+                    })
+                    .buffer_unordered(intermediate_pages.len())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                self.client
+                    .clone()
+                    .respond_workflow_task_completed(final_page.clone().into_request())
+                    .await
+            };
+            match send_all.await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(e)
+                    if is_workflow_task_completion_buffer_lost(&e)
+                        && resends < MAX_WFT_COMPLETION_PAGE_RESENDS =>
+                {
+                    resends += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn complete_activity_task(
@@ -948,6 +1096,9 @@ pub struct WorkflowTaskCompletion {
     pub metering_metadata: MeteringMetadata,
     /// Versioning behavior of the workflow, if any.
     pub versioning_behavior: VersioningBehavior,
+    /// Whether the namespace permits paginating this completion across multiple page requests when
+    /// it would otherwise exceed the server's gRPC request size limit.
+    pub pagination_enabled: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1121,6 +1272,304 @@ mod tests {
             assert!(
                 worker_command_poll.deployment_options.is_none(),
                 "{strategy_name}",
+            );
+        }
+    }
+
+    mod pagination {
+        use super::*;
+        use temporalio_common::protos::{
+            google::rpc::Status as RpcStatus,
+            temporal::api::{
+                command::v1::{CompleteWorkflowExecutionCommandAttributes, command},
+                common::v1::{Payload, Payloads},
+            },
+        };
+
+        fn command_with_payload(data_size: usize) -> Command {
+            Command {
+                attributes: Some(
+                    command::Attributes::CompleteWorkflowExecutionCommandAttributes(
+                        CompleteWorkflowExecutionCommandAttributes {
+                            result: Some(Payloads {
+                                payloads: vec![Payload {
+                                    metadata: Default::default(),
+                                    data: vec![0u8; data_size],
+                                    ..Default::default()
+                                }],
+                            }),
+                        },
+                    ),
+                ),
+                ..Default::default()
+            }
+        }
+
+        fn request_with(commands: Vec<Command>) -> RespondWorkflowTaskCompletedRequest {
+            RespondWorkflowTaskCompletedRequest {
+                task_token: b"task-token".to_vec(),
+                identity: "identity".to_string(),
+                namespace: "namespace".to_string(),
+                commands,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn completion_within_limit_is_a_single_final_page() {
+            let request = request_with(vec![command_with_payload(16)]);
+            let pages = paginate_wft_completion(request, 4096);
+            assert_eq!(pages.len(), 1);
+            assert_eq!(pages[0].page_number, 0);
+            assert!(!pages[0].intermediate_page);
+            assert_eq!(pages[0].commands.len(), 1);
+        }
+
+        #[test]
+        fn large_completion_splits_commands_across_pages() {
+            let max = 1024;
+            let command_count = 6;
+            let commands: Vec<_> = (0..command_count)
+                .map(|_| command_with_payload(400))
+                .collect();
+            let request = request_with(commands);
+            assert!(request.encoded_len() > max);
+
+            let pages = paginate_wft_completion(request, max);
+            assert!(pages.len() >= 2, "expected multiple pages");
+
+            let (intermediate, final_page) = pages.split_at(pages.len() - 1);
+            let final_page = &final_page[0];
+
+            // The final page carries no commands, is not intermediate, and its page number equals
+            // the count of preceding intermediate pages.
+            assert!(!final_page.intermediate_page);
+            assert!(final_page.commands.is_empty());
+            assert_eq!(final_page.page_number as usize, intermediate.len());
+            assert!(final_page.encoded_len() <= max);
+            assert_eq!(final_page.task_token, b"task-token");
+
+            let mut total_commands = 0;
+            for (idx, page) in intermediate.iter().enumerate() {
+                assert!(page.intermediate_page);
+                assert_eq!(page.page_number as usize, idx);
+                assert_eq!(page.task_token, b"task-token");
+                assert!(
+                    page.encoded_len() <= max,
+                    "intermediate page {idx} over limit"
+                );
+                total_commands += page.commands.len();
+            }
+            // Every command is preserved exactly once across the intermediate pages.
+            assert_eq!(total_commands, command_count);
+        }
+
+        #[test]
+        fn single_command_larger_than_a_page_is_not_split() {
+            let max = 1024;
+            let request = request_with(vec![command_with_payload(4096)]);
+            let pages = paginate_wft_completion(request, max);
+            // Cannot be split, so it is left as one (oversized) request for the server to reject.
+            assert_eq!(pages.len(), 1);
+            assert_eq!(pages[0].commands.len(), 1);
+            assert!(!pages[0].intermediate_page);
+        }
+
+        #[test]
+        fn detects_buffer_lost_failure_detail() {
+            let detail = prost_types::Any {
+                type_url: "type.googleapis.com/temporal.api.errordetails.v1.\
+                    WorkflowTaskCompletionBufferLostFailure"
+                    .to_string(),
+                value: vec![],
+            };
+            let rpc_status = RpcStatus {
+                code: tonic::Code::Aborted as i32,
+                message: "buffered pages lost".to_string(),
+                details: vec![detail],
+            };
+            let status = tonic::Status::with_details(
+                tonic::Code::Aborted,
+                "buffered pages lost",
+                rpc_status.encode_to_vec().into(),
+            );
+            assert!(is_workflow_task_completion_buffer_lost(&status));
+
+            let unrelated = tonic::Status::new(tonic::Code::Internal, "boom");
+            assert!(!is_workflow_task_completion_buffer_lost(&unrelated));
+        }
+
+        #[tokio::test]
+        async fn paginated_completion_sends_ordered_pages_sharing_a_token() {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_clone = captured.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let captured = captured_clone.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities::default()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "RespondWorkflowTaskCompleted" => {
+                                captured.lock().unwrap().push(
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid"),
+                                );
+                                RespondWorkflowTaskCompletedResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            // Roughly 4 MiB of commands forces splitting under the ~3 MiB page target.
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: TaskToken(b"shared-token".to_vec()),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+            };
+            client.complete_workflow_task(completion).await.unwrap();
+
+            let sent = captured.lock().unwrap();
+            assert!(
+                sent.len() >= 2,
+                "expected multiple pages, got {}",
+                sent.len()
+            );
+            // Every page shares the one task token.
+            assert!(sent.iter().all(|r| r.task_token == b"shared-token"));
+            // Exactly one final page, numbered after all the intermediate ones.
+            let finals: Vec<_> = sent.iter().filter(|r| !r.intermediate_page).collect();
+            assert_eq!(finals.len(), 1);
+            assert_eq!(finals[0].page_number as usize, sent.len() - 1);
+            assert!(finals[0].commands.is_empty());
+            // Intermediate pages carry sequential page numbers 0..N-1.
+            let mut intermediate_numbers: Vec<_> = sent
+                .iter()
+                .filter(|r| r.intermediate_page)
+                .map(|r| r.page_number)
+                .collect();
+            intermediate_numbers.sort_unstable();
+            assert_eq!(
+                intermediate_numbers,
+                (0..(sent.len() as i32 - 1)).collect::<Vec<_>>()
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_page_cancels_other_inflight_pages() {
+            // Page 0 fails immediately; every other intermediate page hangs forever. The call can
+            // only return if the failed page short-circuits the send and the hung pages are
+            // dropped (cancelled) rather than awaited.
+            let never = Arc::new(tokio::sync::Notify::new());
+            let never_cb = never.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let never = never_cb.clone();
+                    Box::pin(async move {
+                        match request.rpc.as_str() {
+                            "GetSystemInfo" => Ok(GrpcSuccessResponse {
+                                headers: Default::default(),
+                                proto: GetSystemInfoResponse {
+                                    capabilities: Some(Capabilities::default()),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            }),
+                            "RespondWorkflowTaskCompleted" => {
+                                let page =
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid");
+                                if page.intermediate_page && page.page_number == 0 {
+                                    // InvalidArgument is non-retryable, so it is forwarded at once.
+                                    Err(tonic::Status::new(tonic::Code::InvalidArgument, "boom"))
+                                } else {
+                                    never.notified().await;
+                                    unreachable!("a cancelled page must not resume");
+                                }
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        }
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            // Enough commands to yield at least two intermediate pages (one fails, one hangs).
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: TaskToken(b"shared-token".to_vec()),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+            };
+
+            // Without cancellation this would hang on the never-completing page; the timeout guards
+            // against that regression instead of relying on a sleep.
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.complete_workflow_task(completion),
+            )
+            .await
+            .expect("completion resolved without waiting on the hung page");
+            assert!(
+                outcome.is_err(),
+                "the failed page should surface as an error"
             );
         }
     }

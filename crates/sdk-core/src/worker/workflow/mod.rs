@@ -29,7 +29,8 @@ use crate::{
     },
     worker::{
         ActivitySlotKind, CompleteWfError, LocalActRequest, LocalActivityExecutionResult,
-        LocalActivityResolution, PollError, PostActivateHookData, WorkflowSlotKind,
+        LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
+        WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
         client::{LegacyQueryResult, WorkerClient, WorkflowTaskCompletion},
         workflow::{
@@ -135,6 +136,7 @@ pub(crate) struct Workflows {
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
     default_versioning_behavior: Option<VersioningBehavior>,
+    namespace_capabilities: Arc<NamespaceCapabilities>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -142,6 +144,7 @@ pub(crate) struct WorkflowBasics {
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) metrics: MetricsContext,
     pub(crate) server_capabilities: get_system_info_response::Capabilities,
+    pub(crate) namespace_capabilities: Arc<NamespaceCapabilities>,
     pub(crate) sdk_name: String,
     pub(crate) sdk_version: String,
     pub(crate) default_versioning_behavior: Option<VersioningBehavior>,
@@ -178,6 +181,7 @@ impl Workflows {
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
         let default_versioning_behavior = basics.default_versioning_behavior;
+        let namespace_capabilities = basics.namespace_capabilities.clone();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
@@ -268,6 +272,7 @@ impl Workflows {
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
             default_versioning_behavior,
+            namespace_capabilities,
         }
     }
 
@@ -382,6 +387,9 @@ impl Workflows {
                         nonfirst_local_activity_execution_attempts,
                     },
                     versioning_behavior,
+                    pagination_enabled: self
+                        .namespace_capabilities
+                        .workflow_task_completion_pagination(),
                 };
                 let sticky_attrs = self.sticky_attrs.clone();
                 // Do not return new WFT if we would not cache, because returned new WFTs are
