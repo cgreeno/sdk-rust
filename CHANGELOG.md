@@ -65,6 +65,9 @@ to docs, or any other relevant information.
 ## [Unreleased]
 
 ### Added
+* Experimental plugin APIs for packaging reusable client and worker configuration, including data
+  converters, interceptors, activities, workflows, and automatic propagation from clients to
+  workers.
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
 * `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls
